@@ -91,80 +91,7 @@ def generate_prompt_metadata(config):
         json_file.write(json.dumps(json_entries, indent=4))
     return True
 
-
 def train():
-    if config.get('debug_nan', False):
-        DebugUnderflowOverflow(model)
-        logger.info('NaN debugger registered. Start to detect overflow during training.')
-    time_start, last_tic = time.time(), time.time()
-    log_buffer = LogBuffer()
-
-    global_step = start_step + 1
-    
-    # load_*_feat is used to load from the InterData folders where the captions and images have been transformed into their latent values
-    load_vae_feat = getattr(train_dataloader.dataset, 'load_vae_feat', False)
-    load_t5_feat = getattr(train_dataloader.dataset, 'load_t5_feat', False)
-    
-    for epoch in range(start_epoch+1, config.num_epochs+1):
-        data_time_start = time.time()
-        data_time_all = 0
-        for step, batch in enumerate(train_dataloader):
-            if step < skip_step:
-                global_step += 1
-                continue
-            if load_vae_feat:
-                z = batch[0]
-            else:
-                with torch.no_grad():
-                    with torch.cuda.amp.autocast(enabled=(config.mixed_precision == 'fp16' or config.mixed_precision == 'bf16')):
-                        posterior = vae.encode(batch[0]).latent_dist
-                        if config.sample_posterior:
-                            z = posterior.sample()
-                        else:
-                            z = posterior.mode()
-            
-            clean_images = z * config.scale_factor
-            data_info = batch[3]
-            
-            if load_t5_feat:
-                y = batch[1]
-                y_mask = batch[2]
-            else:
-                with torch.no_grad():
-                    txt_tokens = tokenizer(
-                        batch[1], 
-                        max_length=max_length, 
-                        padding="max_length", 
-                        truncation=True, 
-                        return_tensors="pt"
-                    ).to(accelerator.device)
-                    
-                    y = text_encoder(
-                        txt_tokens.input_ids, 
-                        attention_mask=txt_tokens.attention_mask)[0][:, None]
-                    y_mask = txt_tokens.attention_mask[:, None, None]
-            bs = clean_images.shape[0]
-            timesteps = torch.randint(0, config.train_sampling_steps, (bs,), device=clean_images.device).long()
-            grad_norm = None
-            data_time_all += time.time() - data_time_start
-            with accelerator.accumulate(model):
-                # Predict the noise residual
-                # noisy_latents = 
-                optimizer.zero_grad()
-                noise_args = dict(y=y, mask=y_mask, data_info=data_info)
-                loss_term = train_diffusion.training_losses(model, clean_images, timesteps, model_kwargs=noise_args)
-                loss = loss_term['loss'].mean()
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
-                optimizer.step()
-                lr_scheduler.step()
-            lr = lr_scheduler.get_last_lr()[0]
-            global_step += 1
-        accelerator.wait_for_everyone()
-
-
-def train2():
     if config.get('debug_nan', False):
         DebugUnderflowOverflow(model)
         logger.info('NaN debugger registered. Start to detect overflow during training.')
@@ -461,4 +388,4 @@ if __name__ == '__main__':
         
     model = accelerator.prepare(model)
     optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
-    train2()
+    train()
