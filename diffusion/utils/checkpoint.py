@@ -13,6 +13,7 @@ def save_checkpoint(work_dir,
                     lr_scheduler=None,
                     keep_last=False,
                     step=None,
+                    name=None
                     ):
     os.makedirs(work_dir, exist_ok=True)
     state_dict = dict(state_dict=model.state_dict())
@@ -24,7 +25,7 @@ def save_checkpoint(work_dir,
         state_dict['scheduler'] = lr_scheduler.state_dict()
     if epoch is not None:
         state_dict['epoch'] = epoch
-        file_path = os.path.join(work_dir, f"epoch_{epoch}.pth")
+        file_path = os.path.join(work_dir, f"{name}_epoch_{epoch}.pth")
         if step is not None:
             file_path = file_path.split('.pth')[0] + f"_step_{step}.pth"
     logger = get_root_logger()

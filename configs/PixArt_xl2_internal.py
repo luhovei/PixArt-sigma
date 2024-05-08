@@ -1,5 +1,12 @@
 data_root = '/data/data'
-data = dict(type='InternalData', root='images', image_list_json=['data_info.json'], transform='default_train', load_vae_feat=True, load_t5_feat=True)
+data = dict(
+    type='InternalData', 
+    root='images', 
+    image_list_json=['data_info.json'], 
+    transform='default_train', 
+    load_vae_feat=True, 
+    load_t5_feat=True
+)
 image_size = 256  # the generated image resolution
 train_batch_size = 32
 eval_batch_size = 16
@@ -45,7 +52,8 @@ validation_prompts = [
 # we use different weight decay with the official implementation since it results better result
 optimizer = dict(type='AdamW', lr=1e-4, weight_decay=3e-2, eps=1e-10)
 lr_schedule = 'constant'
-lr_schedule_args = dict(num_warmup_steps=500)
+lr_schedule_args = dict(num_warmup_steps=0)
+lr_warmup_steps = 0
 
 save_image_epochs = 1
 save_model_epochs = 1

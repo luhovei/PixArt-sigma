@@ -13,6 +13,8 @@ from typing import Tuple, Optional, Callable
 import torch
 from torch.optim.optimizer import Optimizer
 from came_pytorch import CAME
+from schedulefree import AdamWScheduleFree
+import bitsandbytes as bnb
 
 
 def auto_scale_lr(effective_bs, optimizer_cfg, rule='linear', base_batch_size=256):
@@ -243,4 +245,15 @@ class Lion(Optimizer):
 class CAMEWrapper(CAME):
     def __init__(self, *args, **kwargs):
 
+        super().__init__(*args, **kwargs)
+
+@OPTIMIZERS.register_module()
+class AdamWSchedulerFreeWrapper(AdamWScheduleFree):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+
+@OPTIMIZERS.register_module()
+class AdamW8bit(bnb.optim.AdamW8bit):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

@@ -1,4 +1,4 @@
-from diffusers import get_cosine_schedule_with_warmup, get_constant_schedule_with_warmup
+from diffusers import get_cosine_schedule_with_warmup, get_constant_schedule_with_warmup, get_constant_schedule
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 import math
@@ -23,10 +23,15 @@ def build_lr_scheduler(config, optimizer, train_dataloader, lr_scale_ratio):
             num_training_steps=(len(train_dataloader) * config.num_epochs),
         )
     elif config.lr_schedule == 'constant':
-        lr_scheduler = get_constant_schedule_with_warmup(
-            optimizer=optimizer,
-            **config.lr_schedule_args,
-        )
+        if config.get('lr_warmup_steps', 0) > 0:
+            lr_scheduler = get_constant_schedule_with_warmup(
+                optimizer=optimizer,
+                **config.lr_schedule_args,
+            )
+        else:
+            lr_scheduler = get_constant_schedule(
+                optimizer=optimizer
+            )
     elif config.lr_schedule == 'cosine_decay_to_constant':
         assert lr_scale_ratio >= 1
         lr_scheduler = get_cosine_decay_to_constant_with_warmup(
