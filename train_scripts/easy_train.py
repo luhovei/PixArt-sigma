@@ -10,6 +10,8 @@ import random
 import tqdm
 import mimetypes
 import json
+import math
+import torchvision.utils as tutils
 
 current_file_path = Path(__file__).resolve()
 sys.path.insert(0, str(current_file_path.parent.parent))
@@ -47,6 +49,25 @@ def pyramid_noise_like(noise, device, iterations=6, discount=0.4):
         if wn == 1 or hn == 1:
             break  # Lowest resolution is 1x1
     return noise / noise.std()
+
+def make_bucket_resolutions(max_res, min_size=256, max_size=1024, step_size=64):
+    max_w, max_h = max_res
+    max_area = (max_w // step_size) * (max_h // step_size)
+    resolutions = set()
+    
+    size = int(math.sqrt(max_area)) * step_size
+    resolutions.add((size, size, size / size))
+    size = min_size
+    while size <= max_size:
+        width = size
+        height = min(max_size, (max_area // (width // step_size)) * step_size)
+        resolutions.add((width, height, width / height))
+        resolutions.add((height, width, height / width))
+        
+        size += step_size
+    resolutions = list(resolutions)
+    resolutions.sort()
+    return resolutions #(size, size, aspect_ratio)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Parsing arguments ... ")
@@ -127,6 +148,7 @@ def train():
 
             clean_images = z * config.scale_factor
             data_info = batch[3]
+            # tutils.save_image(batch[0], f"{config.data_root}/latents/latent_{step}.png")
 
             if load_t5_feat:
                 y = batch[1]
@@ -147,22 +169,27 @@ def train():
             data_time_all += time.time() - data_time_start
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                optimizer.zero_grad()
+                
                 noise = torch.randn_like(clean_images, device=clean_images.device)
                 noise = pyramid_noise_like(noise, clean_images)
-                loss_term = train_diffusion.training_losses(
-                    model, 
-                    clean_images, 
-                    timesteps, 
-                    noise=noise,
-                    model_kwargs=dict(y=y, mask=y_mask, data_info=data_info)
-                )
+                # add input perturbation https://arxiv.org/abs/2301.11706
+                noise = noise + config.input_perturbation * torch.rand_like(clean_images, device=clean_images.device)
+                with accelerator.autocast():
+                    loss_term = train_diffusion.training_losses(
+                        model, 
+                        clean_images, 
+                        timesteps, 
+                        noise=noise,
+                        model_kwargs=dict(y=y, mask=y_mask, data_info=data_info)
+                    )
                 loss = loss_term['loss'].mean()
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
+                
                 optimizer.step()
                 lr_scheduler.step()
+                optimizer.zero_grad()
 
             lr = lr_scheduler.get_last_lr()[0]
             logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}
@@ -271,6 +298,42 @@ if __name__ == '__main__':
     max_length = config.model_max_length
     kv_compress_config = config.kv_compress_config if config.kv_compress else None
     
+    set_data_root(config.data_root)
+    buckets = make_bucket_resolutions((config.image_size,config.image_size), config.bucket_size_min, config.bucket_size_max, config.bucket_res_steps)
+    
+    accelerator.print(f"Dataset buckets: {buckets}")
+    
+    dataset = build_dataset(
+        config.data, 
+        resolution=image_size, aspect_ratio_type=config.aspect_ratio_type,
+        real_prompt_ratio=config.real_prompt_ratio, max_length=max_length, 
+        config=config, buckets=buckets
+    )
+    
+    if config.multi_scale:
+        batch_sampler = AspectRatioBatchSampler(
+            sampler=RandomSampler(dataset), dataset=dataset,
+            batch_size=config.train_batch_size, 
+            aspect_ratios=dataset.aspect_ratio, drop_last=True,
+            ratio_nums=dataset.ratio_nums, config=config, 
+            valid_num=config.valid_num
+        )
+        train_dataloader = build_dataloader(
+            dataset, 
+            batch_sampler=batch_sampler, 
+            num_workers=config.num_workers,
+            shuffle=config.shuffle_dataset
+        )
+
+    else:
+        train_dataloader = build_dataloader(
+            dataset, 
+            num_workers=config.num_workers, 
+            batch_size=config.train_batch_size, 
+            shuffle=config.shuffle_dataset
+        )
+    
+    
     accelerator.print(f'Loading vae from {config.vae_file} ... ')
     vae = AutoencoderKL.from_pretrained(config.vae_file, torch_dtype=torch.float16).to(accelerator.device)
     config.scale_factor = vae.config.scaling_factor
@@ -309,6 +372,7 @@ if __name__ == '__main__':
         learn_sigma=learn_sigma,
         pred_sigma=pred_sigma,
         snr=config.snr_loss,
+        rescale_learned_sigmas=True,
         )
     model = build_model(config.model_type,
                         config.grad_checkpointing,
@@ -332,35 +396,7 @@ if __name__ == '__main__':
     
     # TODO: ADD OPTION FOR FSDP clip grad norm calculation
     
-    set_data_root(config.data_root)
-    dataset = build_dataset(
-        config.data, 
-        resolution=image_size, aspect_ratio_type=config.aspect_ratio_type,
-        real_prompt_ratio=config.real_prompt_ratio, max_length=max_length, 
-        config=config,
-    )
-    
-    if config.multi_scale:
-        batch_sampler = AspectRatioBatchSampler(
-            sampler=RandomSampler(dataset), dataset=dataset,
-            batch_size=config.train_batch_size, 
-            aspect_ratios=dataset.aspect_ratio, drop_last=True,
-            ratio_nums=dataset.ratio_nums, config=config, 
-            valid_num=config.valid_num
-        )
-        train_dataloader = build_dataloader(
-            dataset, 
-            batch_sampler=batch_sampler, 
-            num_workers=config.num_workers,
-            # shuffle=config.shuffle_dataset
-        )
-    else:
-        train_dataloader = build_dataloader(
-            dataset, 
-            num_workers=config.num_workers, 
-            batch_size=config.train_batch_size, 
-            # shuffle=config.shuffle_dataset
-        )
+
 
     # Setup optimizer and LR Scheduler
     lr_scale_ratio = 1

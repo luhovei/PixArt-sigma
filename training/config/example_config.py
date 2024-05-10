@@ -29,6 +29,10 @@ output_model_name = "MODEL_OUTPUT_NAME"
 # ----------------------------------
 # ---- DATASET PREPARATION
 image_size = 512 #image resolution [256,512,1024]
+bucket_size_min = 384
+bucket_size_max = 1536
+bucket_upscale = False # do NOT upscale image
+bucket_res_steps = 64 #must be multiple of 8, e.g.: 8, 16, 24, 32, 40, ...
 multi_scale = True #multiscale images
 aspect_ratio_type = "ASPECT_RATIO_512" # [ASPECT_RATIO_1024, ASPECT_RATIO_512, ASPECT_RATIO_256]
 
@@ -81,6 +85,7 @@ gc_step = 1
 valid_num = 0 #take as valid aspect-ratio when sample number >= valid_num
 pred_sigma = True
 learn_sigma = True
+input_perturbation = 0.1 #https://arxiv.org/abs/2301.11706
 
 kv_compress = True
 kv_compress_config = {
