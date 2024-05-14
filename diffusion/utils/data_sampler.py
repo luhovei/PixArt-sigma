@@ -44,7 +44,7 @@ class AspectRatioBatchSampler(BatchSampler):
         assert self.ratio_nums_gt
         # buckets for each aspect ratio
         self._aspect_ratio_buckets = {ratio: [] for ratio in aspect_ratios.keys()}
-        self.current_available_bucket_keys =  [str(k) for k, v in self.ratio_nums_gt.items() if v >= valid_num]
+        self.current_available_bucket_keys =  [str("{:.2f}".format(k)) for k, v in self.ratio_nums_gt.items() if v >= valid_num]
         logger = get_root_logger() if config is None else get_root_logger(os.path.join(config.work_dir, 'train_log.log'))
         logger.warning(f"Using valid_num={valid_num} in config file. Available {len(self.current_available_bucket_keys)} aspect_ratios: {self.current_available_bucket_keys}")
 
@@ -52,7 +52,7 @@ class AspectRatioBatchSampler(BatchSampler):
         for idx in self.sampler:
             data_info = self.dataset.get_data_info(idx)
             height, width =  data_info['height'], data_info['width']
-            ratio = height / width
+            ratio = width / height
             # find the closest aspect ratio
             closest_ratio = min(self.aspect_ratios.keys(), key=lambda r: abs(float(r) - ratio))
             if closest_ratio not in self.current_available_bucket_keys:
@@ -100,7 +100,7 @@ class BalancedAspectRatioBatchSampler(AspectRatioBatchSampler):
         for idx in self.sampler:
             data_info = self.dataset.get_data_info(idx)
             height, width = data_info['height'], data_info['width']
-            ratio = height / width
+            ratio = width / height
             closest_ratio = float(min(self.aspect_ratios.keys(), key=lambda r: abs(float(r) - ratio)))
             if closest_ratio not in self.all_available_keys:
                 continue

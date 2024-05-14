@@ -310,6 +310,11 @@ if __name__ == '__main__':
         config=config, buckets=buckets
     )
     
+    # print(len(dataset), dataset.ratio_nums, sum(dataset.ratio_nums.values()))
+    for bk in dataset.ratio_nums:
+        if dataset.ratio_nums[bk] != 0:
+            accelerator.print(f"({bk}: {dataset.ratio_nums[bk]} / {len(dataset)}) - {dataset.aspect_ratio['{:.2f}'.format(bk)]}")
+    
     if config.multi_scale:
         batch_sampler = AspectRatioBatchSampler(
             sampler=RandomSampler(dataset), dataset=dataset,
@@ -324,7 +329,6 @@ if __name__ == '__main__':
             num_workers=config.num_workers,
             shuffle=config.shuffle_dataset
         )
-
     else:
         train_dataloader = build_dataloader(
             dataset, 
@@ -332,7 +336,6 @@ if __name__ == '__main__':
             batch_size=config.train_batch_size, 
             shuffle=config.shuffle_dataset
         )
-    
     
     accelerator.print(f'Loading vae from {config.vae_file} ... ')
     vae = AutoencoderKL.from_pretrained(config.vae_file, torch_dtype=torch.float16).to(accelerator.device)

@@ -13,7 +13,7 @@ import math
 
 
 def get_closest_ratio(height: float, width: float, ratios: dict):
-    aspect_ratio = height / width
+    aspect_ratio = width / height
     closest_ratio = min(ratios.keys(), key=lambda ratio: abs(float(ratio) - aspect_ratio))
     return ratios[closest_ratio], float(closest_ratio)
 
@@ -383,7 +383,7 @@ class InternalDataMSSigmaCustom(InternalDataSigma):
         self.mask_type = mask_type
         self.real_prompt_ratio = real_prompt_ratio
         self.max_lenth = max_length
-        self.base_size = int(kwargs['aspect_ratio_type'].split('_')[-1])
+        self.base_size = int(config.image_size)
         self.aspect_ratio = eval(kwargs.pop('aspect_ratio_type'))       # base aspect ratio
         self.meta_data_clean = []
         self.img_samples = []
@@ -400,13 +400,15 @@ class InternalDataMSSigmaCustom(InternalDataSigma):
         if self.aspect_ratio in [ASPECT_RATIO_2048, ASPECT_RATIO_2880]:
             self.interpolate_model = InterpolationMode.LANCZOS
         suffix = ''
+        self.bucket_steps = config.bucket_res_steps
         if buckets is not None:
             self.aspect_ratio = {}
             for bucket in buckets:
                 self.aspect_ratio["{:.2f}".format(bucket[2])] = [bucket[0], bucket[1]]
-        for k, v in self.aspect_ratio.items():
-            self.ratio_index[float(k)] = []     # used for self.getitem
-            self.ratio_nums[float(k)] = 0      # used for batch-sampler
+        print(f"We got {len(self.aspect_ratio)}: ", self.aspect_ratio.keys())
+        for r, v in self.aspect_ratio.items():
+            self.ratio_index[float(r)] = []     # used for self.getitem
+            self.ratio_nums[float(r)] = 0      # used for batch-sampler
         logger = get_root_logger() if config is None else get_root_logger(os.path.join(config.work_dir, 'train_log.log'))
         logger.info(f"T5 max token length: {self.max_lenth}")
         logger.info(f"ratio of real user prompt: {self.real_prompt_ratio}")
@@ -511,10 +513,26 @@ class InternalDataMSSigmaCustom(InternalDataSigma):
             txt_fea = txt
 
         if not self.load_vae_feat:
-            if closest_size[0] / ori_h > closest_size[1] / ori_w:
-                resize_size = closest_size[0], int(ori_w * closest_size[0] / ori_h)
+            ori_ar = ori_w / ori_h
+            if closest_ratio < 1.0:
+                if closest_ratio <= ori_ar:
+                    resize_size = math.ceil(closest_size[1]*ori_ar), closest_size[1]
+                else:
+                    resize_size = closest_size[0], math.ceil(closest_size[0]/ori_ar)
+            elif closest_ratio == 1.0:
+                if closest_ratio <= ori_ar:
+                    resize_size = math.ceil(closest_size[0]*ori_ar), math.ceil(closest_size[0]*ori_ar)
+                else:
+                    resize_size = math.ceil(closest_size[0]/ori_ar), math.ceil(closest_size[0]/ori_ar)
             else:
-                resize_size = int(ori_h * closest_size[1] / ori_w), closest_size[1]
+                if closest_ratio <= ori_ar:
+                    resize_size = math.ceil(closest_size[1]*ori_ar), closest_size[1]
+                else:
+                    resize_size = closest_size[0], math.ceil(closest_size[0]/ori_ar)
+            resize_size = (resize_size[1], resize_size[0])
+            closest_size = (closest_size[1], closest_size[0])
+            # print(closest_size, closest_ratio, ori_w, ori_h, ori_ar, resize_size)
+            
             self.transform = T.Compose([
                 T.Lambda(lambda img: img.convert('RGB')),
                 T.Resize(resize_size, interpolation=self.interpolate_model),  # Image.BICUBIC
@@ -529,11 +547,13 @@ class InternalDataMSSigmaCustom(InternalDataSigma):
         return img, txt_fea, attention_mask.to(torch.int16), data_info
 
     def __getitem__(self, idx):
-        for _ in range(20):
-            try:
-                data = self.getdata(idx)
-                return data
-            except Exception as e:
-                print(f"Error details: {str(e)}")
-                idx = random.choice(self.ratio_index[self.closest_ratio])
-        raise RuntimeError('Too many bad data.')
+        data = self.getdata(idx)
+        return data
+        # for _ in range(20):
+        #     try:
+        #         data = self.getdata(idx)
+        #         return data
+        #     except Exception as e:
+        #         print(f"Error details: {str(e)}")
+        #         idx = random.choice(self.ratio_index[self.closest_ratio])
+        # raise RuntimeError('Too many bad data.')
