@@ -91,6 +91,50 @@ def apply_snr_weight(loss, timesteps, noise_scheduler, gamma):
     loss = loss * snr_weight
     return loss
 
+def apply_debiased_estimation_loss(loss, timesteps, noise_scheduler):
+    snr_t = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])  # batch_size
+    snr_t = torch.minimum(snr_t, torch.ones_like(snr_t) * 1000)  # if timestep is 0, snr_t is inf, so limit it to 1000
+    weight = 1/(torch.sqrt(snr_t) + 1e-10)
+    loss = weight * loss
+    return loss
+
+def training_losses_ddpm(model, latents, timesteps, noise, model_kwargs):
+    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+    if config.prediction_type is not None:
+        noise_scheduler.register_to_config(prediction_type=config.prediction_type)    
+    
+    if noise_scheduler.config.prediction_type == 'epsilon':
+        target = noise
+    elif noise_scheduler.config.prediction_type == 'v_prediction':
+        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+    else:
+        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+    noise_pred = model(
+        noisy_latents, 
+        timesteps, 
+        **model_kwargs
+    ).chunk(2, 1)[0]
+    
+    if config.use_huber_loss is False:
+        loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+    else:
+        huber_c = 0.002
+        alpha = -math.log(huber_c) / noise_scheduler.config.num_train_timesteps
+        huber_c = math.exp(-alpha * timesteps[0])
+    
+        loss = torch.mean(
+            huber_c * (torch.sqrt((noise_pred.float() - target.float()) ** 2 + huber_c**2) - huber_c)
+        ).to(accelerator.device)
+    if config.snr_loss:
+        loss = apply_snr_weight(loss, timesteps, noise_scheduler, config.min_snr_gamma)
+        
+    if config.debiased_estimation_loss:
+        loss = apply_debiased_estimation_loss(loss, timesteps, noise_scheduler)
+        
+    # loss = loss.mean().to(accelerator.device)
+    return {"loss": loss}
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Parsing arguments ... ")
     parser.add_argument("--config", type=str, help="Config file for training")
@@ -173,20 +217,7 @@ def train():
                 noise += config.input_perturbation * torch.rand_like(latents, device=latents.device)
                 
                 bsz = latents.shape[0]
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
-                # timesteps = timesteps.long()
-                
-
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                if config.prediction_type is not None:
-                    noise_scheduler.register_to_config(prediction_type=config.prediction_type)    
-                
-                if noise_scheduler.config.prediction_type == 'epsilon':
-                    target = noise
-                elif noise_scheduler.config.prediction_type == 'v_prediction':
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                timesteps = torch.randint(0, config.train_sampling_steps, (bsz,), device=latents.device).long()
                 
                 # added_cond_kwargs = {"resolution": None, "aspect_ratio": None}
                 data_info = batch[3]
@@ -206,27 +237,24 @@ def train():
                         y_mask = txt_tokens.attention_mask[:, None, None]
                     
                     model_kwargs=dict(y=y, mask=y_mask, data_info=data_info)
-                    noise_pred = model(
-                        noisy_latents, 
-                        timesteps, 
-                        **model_kwargs
-                        ).chunk(2, 1)[0]
-                
-                # print(noise_pred.chunk(2, 1)[0].shape, target.shape, noisy_latents.shape)
-                # assert noise_pred.shape == target.shape == noisy_latents.shape
-                if config.use_huber_loss is False:
-                    loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
-                else:
-                    huber_c = 0.002
-                    alpha = -math.log(huber_c) / noise_scheduler.config.num_train_timesteps
-                    huber_c = math.exp(-alpha * timesteps[0])
-                
-                    loss = torch.mean(
-                        huber_c * (torch.sqrt((noise_pred.float() - target.float()) ** 2 + huber_c**2) - huber_c)
-                    ).to(accelerator.device)
-                    if config.snr_loss is not False:
-                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, config.min_snr_gamma)
-                    loss = loss.mean().to(accelerator.device)
+                    if config.use_iddpm:
+                        loss_term = train_diffusion.training_losses(
+                            model,
+                            latents,
+                            timesteps,
+                            noise=noise,
+                            model_kwargs=model_kwargs
+                        )
+                    else:
+                        loss_term = training_losses_ddpm(
+                            model, 
+                            latents, 
+                            timesteps,
+                            noise=noise,
+                            model_kwargs=model_kwargs
+                        )
+                    
+                    loss = loss_term["loss"].mean().to(accelerator.device)
                 
                 avg_loss = accelerator.gather(loss.repeat(config.train_batch_size)).mean()
                 train_loss += avg_loss.item() / config.gradient_accumulation_steps
@@ -235,13 +263,11 @@ def train():
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
                 
-                
                 optimizer.step()
                 lr_scheduler.step()
+                if config.optimizer["type"].lower().endswith("sophia"):
+                    optimizer.optimizer.update_hessian()
                 optimizer.zero_grad()
-                
-                # start = time.process_time()
-                # print(time.process_time() - start)
                 
                 if accelerator.sync_gradients:
                     accelerator.log({"train_loss": train_loss}, step=global_step)
@@ -503,18 +529,21 @@ if __name__ == '__main__':
         "micro_condition": config.micro_condition,
     }
     
-    # train_diffusion = IDDPM(
-    #     str(config.train_sampling_steps),
-    #     learn_sigma=learn_sigma,
-    #     pred_sigma=pred_sigma,
-    #     snr=config.snr_loss,
-    #     rescale_learned_sigmas=True,
-    #     )
-    
-    noise_scheduler = DDPMScheduler(
-        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=config.train_sampling_steps, clip_sample=True, timestep_spacing='trailing', rescale_betas_zero_snr=True,
-    )
-    prepare_scheduler_for_custom_training(noise_scheduler=noise_scheduler, device=accelerator.device)
+    train_diffusion = None
+    noise_scheduler = None
+    if config.use_iddpm:
+        train_diffusion = IDDPM(
+            str(config.train_sampling_steps),
+            learn_sigma=learn_sigma,
+            pred_sigma=pred_sigma,
+            snr=config.snr_loss,
+            rescale_learned_sigmas=True,
+        )
+    else:
+        noise_scheduler = DDPMScheduler(
+            beta_start=0.0001, beta_end=0.02, beta_schedule="scaled_linear", num_train_timesteps=config.train_sampling_steps, clip_sample=True, timestep_spacing='trailing', rescale_betas_zero_snr=True,
+        )
+        prepare_scheduler_for_custom_training(noise_scheduler=noise_scheduler, device=accelerator.device)
     
     model = build_model(config.model_type,
                         config.grad_checkpointing,

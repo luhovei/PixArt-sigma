@@ -62,7 +62,7 @@ auto_lr = dict(rule="sqrt") #linear|sqrt
 lr_schedule = "constant"
 lr_schedule_args = dict(num_warmup_steps=0)
 lr_warmup_steps = 0
-
+use_iddpm = False
 
 # --- ADVANCED
 gradient_accumulation_steps = 1
@@ -77,6 +77,7 @@ snr_loss=False
 min_snr_gamma=3
 sample_posterior=True
 use_huber_loss=True
+debiased_estimation_loss=True
 
 scale_factor = 0.13025 # SDXL VAE scaling factor, should NOT be changed
 pe_interpolation = 1.0 #positional embedding interpolation
