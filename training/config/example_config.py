@@ -37,7 +37,7 @@ multi_scale = True #multiscale images
 aspect_ratio_type = "ASPECT_RATIO_512" # [ASPECT_RATIO_1024, ASPECT_RATIO_512, ASPECT_RATIO_256]
 
 data = dict(
-    type='InternalDataMSSigma',  #use InternalData<<MS>>Sigma for multi-size images
+    type='InternalDataMSSigmaCustom',  #use InternalData<<MS>>Sigma for multi-size images
     root='InternData', #this is where the data.json metadata file is contained 
     image_list_json=['data_info.json'], 
     transform='default_train', 
@@ -52,8 +52,8 @@ shuffle_dataset = True
 # --- BASIC
 train_batch_size = 1 #16
 num_epochs = 10
-mixed_precision = 'fp16'  # ['fp16', 'fp32', 'bf16']
-fp32_attention = True
+mixed_precision = 'bf16'  # ['fp16', 'fp32', 'bf16']
+fp32_attention = False
 
 # optimizer = dict(type='AdamWSchedulerFreeWrapper', lr=1e-5, weight_decay=3e-2, eps=1e-10)
 # optimizer = dict(type='CAMEWrapper', lr=1.618e-6, weight_decay=0.0, betas=(0.9, 0.999, 0.9999), eps=(1e-30, 1e-16))
@@ -74,7 +74,9 @@ real_prompt_ratio = 0.7 #ratio to switch between prompt and sharegpt4v caption
 grad_checkpointing = True
 train_sampling_steps=1000
 snr_loss=False
-sample_posterior = False
+min_snr_gamma=3
+sample_posterior=True
+use_huber_loss=True
 
 scale_factor = 0.13025 # SDXL VAE scaling factor, should NOT be changed
 pe_interpolation = 1.0 #positional embedding interpolation
@@ -86,8 +88,9 @@ valid_num = 0 #take as valid aspect-ratio when sample number >= valid_num
 pred_sigma = True
 learn_sigma = True
 input_perturbation = 0.1 #https://arxiv.org/abs/2301.11706
+prediction_type=None # [epsilon, v_prediction, None]
 
-kv_compress = True
+kv_compress = False
 kv_compress_config = {
     'sampling': "conv", # ['conv', 'uniform', 'ave']
     'scale_factor': 2,
