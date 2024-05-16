@@ -463,7 +463,7 @@ class InternalDataMSSigmaCustom(InternalDataSigma):
             self.sample_subset(sample_subset)  # sample dataset for local debug
 
         # scan the dataset for ratio static
-        for i, info in enumerate(self.meta_data_clean[:len(self.meta_data_clean)//3]):
+        for i, info in enumerate(self.meta_data_clean[:len(self.meta_data_clean)]):
             ori_h, ori_w = info['height'], info['width']
             closest_size, closest_ratio = get_closest_ratio(ori_h, ori_w, self.aspect_ratio)
             self.ratio_nums[closest_ratio] += 1

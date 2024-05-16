@@ -6,8 +6,8 @@ from diffusion.utils.logger import get_root_logger
 
 
 def save_checkpoint(work_dir,
-                    epoch,
                     model,
+                    epoch=None,
                     model_ema=None,
                     optimizer=None,
                     lr_scheduler=None,

@@ -25,6 +25,8 @@ from transformers import T5EncoderModel, T5Tokenizer
 from mmcv.runner import LogBuffer
 from PIL import Image
 from torch.utils.data import RandomSampler
+from diffusers import DDPMScheduler
+import torch.nn.functional as F
 
 from diffusion import IDDPM, DPMS
 from diffusion.data.builder import build_dataset, build_dataloader, set_data_root
@@ -68,6 +70,26 @@ def make_bucket_resolutions(max_res, min_size=256, max_size=1024, step_size=64):
     resolutions = list(resolutions)
     resolutions.sort()
     return resolutions #(size, size, aspect_ratio)
+
+def prepare_scheduler_for_custom_training(noise_scheduler, device):
+    if hasattr(noise_scheduler, "all_snr"):
+        return
+
+    alphas_cumprod = noise_scheduler.alphas_cumprod
+    sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
+    sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
+    alpha = sqrt_alphas_cumprod
+    sigma = sqrt_one_minus_alphas_cumprod
+    all_snr = (alpha / sigma) ** 2
+
+    noise_scheduler.all_snr = all_snr.to(device)
+
+def apply_snr_weight(loss, timesteps, noise_scheduler, gamma):
+    snr = torch.stack([noise_scheduler.all_snr[t] for t in timesteps])
+    gamma_over_snr = torch.div(torch.ones_like(snr) * gamma, snr)
+    snr_weight = torch.minimum(gamma_over_snr, torch.ones_like(gamma_over_snr)).float().to(loss.device)  # from paper
+    loss = loss * snr_weight
+    return loss
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Parsing arguments ... ")
@@ -124,128 +146,226 @@ def train():
     load_vae_feat = getattr(train_dataloader.dataset, 'load_vae_feat', False)
     load_t5_feat = getattr(train_dataloader.dataset, 'load_t5_feat', False)
     
-    model.train()
-    # optimizer.optimizer.train()
+    progress_bar = tqdm.tqdm(range(total_steps), smoothing=0, disable=not accelerator.is_local_main_process, desc="Steps")
     
     # Now you train the model
     for epoch in range(start_epoch + 1, config.num_epochs + 1):
-        data_time_start= time.time()
-        data_time_all = 0
+        # accelerator.print(f"\nEpoch: {epoch} / {config.num_epochs + 1}")
+        model.train()
+        train_loss = 0.0
+        # optimizer.optimizer.train()
+        
         for step, batch in enumerate(train_dataloader):
-            if step < skip_step:
-                global_step += 1
-                continue    # skip data in the resumed ckpt
-            if load_vae_feat:
-                z = batch[0]
-            else:
+            # start = time.process_time()
+            # if step < skip_step:
+            #     global_step += 1
+            #     continue    # skip data in the resumed ckpt
+            
+            with accelerator.accumulate(model):
                 with torch.no_grad():
                     with torch.cuda.amp.autocast(enabled=(config.mixed_precision == 'fp16' or config.mixed_precision == 'bf16')):
-                        posterior = vae.encode(batch[0]).latent_dist
-                        if config.sample_posterior:
-                            z = posterior.sample()
-                        else:
-                            z = posterior.mode()
+                        latents = vae.encode(batch[0]).latent_dist.sample().mul_(config.scale_factor)
+                    
 
-            clean_images = z * config.scale_factor
-            data_info = batch[3]
-            # tutils.save_image(batch[0], f"{config.data_root}/latents/latent_{step}.png")
-
-            if load_t5_feat:
-                y = batch[1]
-                y_mask = batch[2]
-            else:
-                with torch.no_grad():
-                    txt_tokens = tokenizer(
-                        batch[1], max_length=max_length, padding="max_length", truncation=True, return_tensors="pt"
-                    ).to(accelerator.device)
-                    y = text_encoder(
-                        txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask)[0][:, None]
-                    y_mask = txt_tokens.attention_mask[:, None, None]
-
-            # Sample a random timestep for each image
-            bs = clean_images.shape[0]
-            timesteps = torch.randint(0, config.train_sampling_steps, (bs,), device=clean_images.device).long()
-            grad_norm = None
-            data_time_all += time.time() - data_time_start
-            with accelerator.accumulate(model):
-                # Predict the noise residual
-                
-                noise = torch.randn_like(clean_images, device=clean_images.device)
-                noise = pyramid_noise_like(noise, clean_images)
+                noise = torch.randn_like(latents, device=latents.device)
+                noise = pyramid_noise_like(noise, latents, 10, 0.8)
                 # add input perturbation https://arxiv.org/abs/2301.11706
-                noise = noise + config.input_perturbation * torch.rand_like(clean_images, device=clean_images.device)
+                noise += config.input_perturbation * torch.rand_like(latents, device=latents.device)
+                
+                bsz = latents.shape[0]
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
+                # timesteps = timesteps.long()
+                
+
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                if config.prediction_type is not None:
+                    noise_scheduler.register_to_config(prediction_type=config.prediction_type)    
+                
+                if noise_scheduler.config.prediction_type == 'epsilon':
+                    target = noise
+                elif noise_scheduler.config.prediction_type == 'v_prediction':
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                
+                # added_cond_kwargs = {"resolution": None, "aspect_ratio": None}
+                data_info = batch[3]
                 with accelerator.autocast():
-                    loss_term = train_diffusion.training_losses(
-                        model, 
-                        clean_images, 
+                    with torch.set_grad_enabled(False):
+                        txt_tokens = tokenizer(
+                            batch[1], 
+                            max_length=max_length, 
+                            padding="max_length", 
+                            truncation=True, 
+                            return_tensors="pt"
+                        ).to(accelerator.device)
+                        y = text_encoder(
+                            txt_tokens.input_ids, 
+                            attention_mask=txt_tokens.attention_mask
+                        )[0][:, None]
+                        y_mask = txt_tokens.attention_mask[:, None, None]
+                    
+                    model_kwargs=dict(y=y, mask=y_mask, data_info=data_info)
+                    noise_pred = model(
+                        noisy_latents, 
                         timesteps, 
-                        noise=noise,
-                        model_kwargs=dict(y=y, mask=y_mask, data_info=data_info)
-                    )
-                loss = loss_term['loss'].mean()
+                        **model_kwargs
+                        ).chunk(2, 1)[0]
+                
+                # print(noise_pred.chunk(2, 1)[0].shape, target.shape, noisy_latents.shape)
+                # assert noise_pred.shape == target.shape == noisy_latents.shape
+                if config.use_huber_loss is False:
+                    loss = F.mse_loss(noise_pred.float(), target.float(), reduction="mean")
+                else:
+                    huber_c = 0.002
+                    alpha = -math.log(huber_c) / noise_scheduler.config.num_train_timesteps
+                    huber_c = math.exp(-alpha * timesteps[0])
+                
+                    loss = torch.mean(
+                        huber_c * (torch.sqrt((noise_pred.float() - target.float()) ** 2 + huber_c**2) - huber_c)
+                    ).to(accelerator.device)
+                    if config.snr_loss is not False:
+                        loss = apply_snr_weight(loss, timesteps, noise_scheduler, config.min_snr_gamma)
+                    loss = loss.mean().to(accelerator.device)
+                
+                avg_loss = accelerator.gather(loss.repeat(config.train_batch_size)).mean()
+                train_loss += avg_loss.item() / config.gradient_accumulation_steps
+                
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
+                    accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
+                
                 
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
+                
+                # start = time.process_time()
+                # print(time.process_time() - start)
+                
+                if accelerator.sync_gradients:
+                    accelerator.log({"train_loss": train_loss}, step=global_step)
+                    progress_bar.update(1)
+                    global_step += 1
+                    train_loss = 0.0
+            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+            # print(time.process_time() - start)
+            
+            # =================================
+            # if load_vae_feat:
+            #     z = batch[0]
+            # else:
+            #     with torch.no_grad():
+            #         with torch.cuda.amp.autocast(enabled=(config.mixed_precision == 'fp16' or config.mixed_precision == 'bf16')):
+            #             posterior = vae.encode(batch[0]).latent_dist
+            #             if config.sample_posterior:
+            #                 z = posterior.sample()
+            #             else:
+            #                 z = posterior.mode()
 
-            lr = lr_scheduler.get_last_lr()[0]
-            logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}
-            if grad_norm is not None:
-                logs.update(grad_norm=accelerator.gather(grad_norm).mean().item())
-            log_buffer.update(logs)
-            if (step + 1) % config.log_interval == 0 or (step + 1) == 1:
-                t = (time.time() - last_tic) / config.log_interval
-                t_d = data_time_all / config.log_interval
-                avg_time = (time.time() - time_start) / (global_step + 1)
-                eta = str(datetime.timedelta(seconds=int(avg_time * (total_steps - global_step - 1))))
-                eta_epoch = str(datetime.timedelta(seconds=int(avg_time * (len(train_dataloader) - step - 1))))
-                log_buffer.average()
-                info = f"Step/Epoch [{global_step}/{epoch}][{step + 1}/{len(train_dataloader)}]:total_eta: {eta}, " \
-                       f"epoch_eta:{eta_epoch}, time_all:{t:.3f}, time_data:{t_d:.3f}, lr:{lr:.3e}"
-                info += ', '.join([f"{k}:{v:.4f}" for k, v in log_buffer.output.items()])
-                logger.info(info)
-                last_tic = time.time()
-                log_buffer.clear()
-                data_time_all = 0
-            logs.update(lr=lr)
-            accelerator.log(logs, step=global_step)
+            # clean_images = z * config.scale_factor
+            # data_info = batch[3]
+            # # tutils.save_image(batch[0], f"{config.data_root}/latents/latent_{step}.png")
 
-            global_step += 1
-            data_time_start = time.time()
+            # if load_t5_feat:
+            #     y = batch[1]
+            #     y_mask = batch[2]
+            # else:
+            #     with torch.no_grad():
+            #         txt_tokens = tokenizer(
+            #             batch[1], max_length=max_length, padding="max_length", truncation=True, return_tensors="pt"
+            #         ).to(accelerator.device)
+            #         y = text_encoder(
+            #             txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask)[0][:, None]
+            #         y_mask = txt_tokens.attention_mask[:, None, None]
+
+            # # Sample a random timestep for each image
+            # bs = clean_images.shape[0]
+            # timesteps = torch.randint(0, config.train_sampling_steps, (bs,), device=clean_images.device).long()
+            # grad_norm = None
+            # data_time_all += time.time() - data_time_start
+            # with accelerator.accumulate(model):
+            #     # Predict the noise residual
+            #     noise = torch.randn_like(clean_images, device=clean_images.device)
+            #     noise = pyramid_noise_like(noise, clean_images)
+            #     # add input perturbation https://arxiv.org/abs/2301.11706
+            #     noise = noise + config.input_perturbation * torch.rand_like(clean_images, device=clean_images.device)
+            #     with accelerator.autocast():
+            #         loss_term = train_diffusion.training_losses(
+            #             model, 
+            #             clean_images, 
+            #             timesteps, 
+            #             noise=noise,
+            #             model_kwargs=dict(y=y, mask=y_mask, data_info=data_info)
+            #         )
+            #     loss = loss_term['loss'].mean()
+            #     accelerator.backward(loss)
+                
+            #     optimizer.step()
+            #     lr_scheduler.step()
+            #     optimizer.zero_grad()
+                
+            #     if accelerator.sync_gradients:
+            #         accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
+            #     progress_bar.update(1)
+
+
+            # lr = lr_scheduler.get_last_lr()[0]
+            
+            # logs = {args.loss_report_name: accelerator.gather(loss).mean().item()}
+            # if grad_norm is not None:
+            #     logs.update(grad_norm=accelerator.gather(grad_norm).mean().item())
+            # log_buffer.update(logs)
+            # if (step + 1) % config.log_interval == 0 or (step + 1) == 1:
+            #     t = (time.time() - last_tic) / config.log_interval
+            #     t_d = data_time_all / config.log_interval
+            #     avg_time = (time.time() - time_start) / (global_step + 1)
+            #     eta = str(datetime.timedelta(seconds=int(avg_time * (total_steps - global_step - 1))))
+            #     eta_epoch = str(datetime.timedelta(seconds=int(avg_time * (len(train_dataloader) - step - 1))))
+            #     log_buffer.average()
+            #     info = f"Step/Epoch [{global_step}/{epoch}][{step + 1}/{len(train_dataloader)}]:total_eta: {eta}, " \
+            #            f"epoch_eta:{eta_epoch}, time_all:{t:.3f}, time_data:{t_d:.3f}, lr:{lr:.3e}"
+            #     info += ', '.join([f"{k}:{v:.4f}" for k, v in log_buffer.output.items()])
+            #     logger.info(info)
+            #     last_tic = time.time()
+            #     log_buffer.clear()
+            #     data_time_all = 0
+            # logs.update(lr=lr)
+            # accelerator.log(logs, step=global_step)
+
+            # global_step += 1
+            # data_time_start = time.time()
+            # =====================================
 
             if global_step % config.save_model_steps == 0:
+                # model.to(torch.float32)
                 accelerator.wait_for_everyone()
                 if accelerator.is_main_process:
                     os.umask(0o000)
                     save_checkpoint(os.path.join(config.work_dir, 'checkpoints'),
-                                    epoch=epoch,
-                                    step=global_step,
                                     model=accelerator.unwrap_model(model),
-                                    optimizer=optimizer,
-                                    lr_scheduler=lr_scheduler,
+                                    epoch=epoch,
                                     name=config.output_model_name
                                     )
-            if config.visualize and (global_step % config.eval_sampling_steps == 0 or (step + 1) == 1):
-                accelerator.wait_for_everyone()
+            # if config.visualize and (global_step % config.eval_sampling_steps == 0 or (step + 1) == 1):
+            #     accelerator.wait_for_everyone()
                 # if accelerator.is_main_process:
                 #     log_validation(model, global_step, device=accelerator.device, vae=vae)
 
         if epoch % config.save_model_epochs == 0 or epoch == config.num_epochs:
+            # model.to(torch.float32)
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 os.umask(0o000)
                 save_checkpoint(os.path.join(config.work_dir, 'checkpoints'),
-                                epoch=epoch,
-                                step=global_step,
                                 model=accelerator.unwrap_model(model),
-                                optimizer=optimizer,
-                                lr_scheduler=lr_scheduler,
+                                epoch=epoch,
                                 name=config.output_model_name
                                 )
         accelerator.wait_for_everyone()
+    accelerator.end_training()
+
 
 if __name__ == '__main__':
     args = parse_args()
@@ -337,15 +457,28 @@ if __name__ == '__main__':
             shuffle=config.shuffle_dataset
         )
     
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+    
     accelerator.print(f'Loading vae from {config.vae_file} ... ')
-    vae = AutoencoderKL.from_pretrained(config.vae_file, torch_dtype=torch.float16).to(accelerator.device)
+    vae = AutoencoderKL.from_pretrained(config.vae_file, torch_dtype=weight_dtype).to(accelerator.device)
     config.scale_factor = vae.config.scaling_factor
     logger.info(f"VAE Scale Factor: {config.scale_factor}")
     accelerator.print('VAE LOADED!')
+
+    accelerator.print(f'Loading Tokenizer from {config.te_file} ... ')
+    tokenizer = T5Tokenizer.from_pretrained(config.te_file, subfolder="tokenizer")    
+    accelerator.print(f'Loading Text Encoder from {config.te_file} ... ')
+    text_encoder = T5EncoderModel.from_pretrained(config.te_file, subfolder="text_encoder", torch_dtype=weight_dtype).to(accelerator.device)
     
-    accelerator.print(f'Loading TE/TOKENIZER from {config.te_file} ... ')
-    tokenizer = T5Tokenizer.from_pretrained(config.te_file, subfolder="tokenizer")
-    text_encoder = T5EncoderModel.from_pretrained(config.te_file, subfolder="text_encoder", torch_dtype=torch.float16).to(accelerator.device)
+    text_encoder.requires_grad_(False)
+    if config.grad_checkpointing:
+        text_encoder.gradient_checkpointing_enable()
+        text_encoder.train()
+    
     accelerator.print('TE/TOKENIZER LOADED!')
     
     # TODO: ADD VISUALIZE/VALIDATION LOSS GENERATION DATA
@@ -370,13 +503,19 @@ if __name__ == '__main__':
         "micro_condition": config.micro_condition,
     }
     
-    train_diffusion = IDDPM(
-        str(config.train_sampling_steps),
-        learn_sigma=learn_sigma,
-        pred_sigma=pred_sigma,
-        snr=config.snr_loss,
-        rescale_learned_sigmas=True,
-        )
+    # train_diffusion = IDDPM(
+    #     str(config.train_sampling_steps),
+    #     learn_sigma=learn_sigma,
+    #     pred_sigma=pred_sigma,
+    #     snr=config.snr_loss,
+    #     rescale_learned_sigmas=True,
+    #     )
+    
+    noise_scheduler = DDPMScheduler(
+        beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=config.train_sampling_steps, clip_sample=True, timestep_spacing='trailing', rescale_betas_zero_snr=True,
+    )
+    prepare_scheduler_for_custom_training(noise_scheduler=noise_scheduler, device=accelerator.device)
+    
     model = build_model(config.model_type,
                         config.grad_checkpointing,
                         config.get('fp32_attention', False),
@@ -384,6 +523,7 @@ if __name__ == '__main__':
                         learn_sigma=learn_sigma,
                         pred_sigma=pred_sigma,
                         **model_kwargs).train()
+    model.to(accelerator.device)
     model.requires_grad_(True)
     
     logger.info(f"{model.__class__.__name__} Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -423,8 +563,8 @@ if __name__ == '__main__':
     start_epoch = 0
     start_step = 0
     skip_step = config.skip_step
-    total_steps = len(train_dataloader) * config.num_epochs
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / config.gradient_accumulation_steps)
+    total_steps = num_update_steps_per_epoch * config.num_epochs
         
-    model = accelerator.prepare(model)
-    optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(model, optimizer, train_dataloader, lr_scheduler)
     train()
