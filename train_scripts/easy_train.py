@@ -126,13 +126,14 @@ def training_losses_ddpm(model, latents, timesteps, noise, model_kwargs):
         loss = torch.mean(
             huber_c * (torch.sqrt((noise_pred.float() - target.float()) ** 2 + huber_c**2) - huber_c)
         ).to(accelerator.device)
+    
     if config.snr_loss:
         loss = apply_snr_weight(loss, timesteps, noise_scheduler, config.min_snr_gamma)
         
     if config.debiased_estimation_loss:
         loss = apply_debiased_estimation_loss(loss, timesteps, noise_scheduler)
         
-    # loss = loss.mean().to(accelerator.device)
+    loss = loss.mean().to(accelerator.device)
     return {"loss": loss}
 
 def parse_args():
@@ -197,7 +198,8 @@ def train():
         # accelerator.print(f"\nEpoch: {epoch} / {config.num_epochs + 1}")
         model.train()
         train_loss = 0.0
-        # optimizer.optimizer.train()
+        if config.optimizer["type"].lower().endswith("schedulefree"):
+            optimizer.optimizer.train()
         
         for step, batch in enumerate(train_dataloader):
             # start = time.process_time()
@@ -210,7 +212,7 @@ def train():
                     with torch.cuda.amp.autocast(enabled=(config.mixed_precision == 'fp16' or config.mixed_precision == 'bf16')):
                         latents = vae.encode(batch[0]).latent_dist.sample().mul_(config.scale_factor)
                     
-
+                grad_norm = None
                 noise = torch.randn_like(latents, device=latents.device)
                 noise = pyramid_noise_like(noise, latents, 10, 0.8)
                 # add input perturbation https://arxiv.org/abs/2301.11706
@@ -261,7 +263,7 @@ def train():
                 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
+                    grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clip)
                 
                 optimizer.step()
                 lr_scheduler.step()
@@ -274,7 +276,11 @@ def train():
                     progress_bar.update(1)
                     global_step += 1
                     train_loss = 0.0
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            if grad_norm is None:
+                grad_norm = 0.0
+            else:
+                grad_norm = accelerator.gather(grad_norm).mean().item()
+            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "grad_norm": grad_norm}
             progress_bar.set_postfix(**logs)
             # print(time.process_time() - start)
             
@@ -363,7 +369,9 @@ def train():
             # global_step += 1
             # data_time_start = time.time()
             # =====================================
-
+            if config.optimizer["type"].lower().endswith("schedulefree"):
+                optimizer.optimizer.eval()
+                model.eval()
             if global_step % config.save_model_steps == 0:
                 # model.to(torch.float32)
                 accelerator.wait_for_everyone()
@@ -383,6 +391,9 @@ def train():
             # model.to(torch.float32)
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
+                if config.optimizer["type"].lower().endswith("schedulefree"):
+                    optimizer.optimizer.eval()
+                    model.eval()
                 os.umask(0o000)
                 save_checkpoint(os.path.join(config.work_dir, 'checkpoints'),
                                 model=accelerator.unwrap_model(model),
@@ -541,13 +552,14 @@ if __name__ == '__main__':
         )
     else:
         noise_scheduler = DDPMScheduler(
-            beta_start=0.0001, beta_end=0.02, beta_schedule="scaled_linear", num_train_timesteps=config.train_sampling_steps, clip_sample=True, timestep_spacing='trailing', rescale_betas_zero_snr=True,
+            beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=config.train_sampling_steps, clip_sample=True, timestep_spacing='trailing', rescale_betas_zero_snr=True,
         )
         prepare_scheduler_for_custom_training(noise_scheduler=noise_scheduler, device=accelerator.device)
     
     model = build_model(config.model_type,
                         config.grad_checkpointing,
                         config.get('fp32_attention', False),
+                        gc_step=config.gc_step,
                         input_size=latent_size,
                         learn_sigma=learn_sigma,
                         pred_sigma=pred_sigma,

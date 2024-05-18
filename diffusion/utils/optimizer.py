@@ -249,7 +249,7 @@ class CAMEWrapper(CAME):
         super().__init__(*args, **kwargs)
 
 @OPTIMIZERS.register_module()
-class AdamWSchedulerFreeWrapper(AdamWScheduleFree):
+class AdamWSchedulerFree(AdamWScheduleFree):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
