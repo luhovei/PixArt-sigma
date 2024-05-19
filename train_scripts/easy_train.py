@@ -41,6 +41,75 @@ from diffusion.utils.optimizer import build_optimizer, auto_scale_lr
 
 warnings.filterwarnings("ignore")
 
+@torch.inference_mode()
+def log_sampling(model, step, device, vae=None):
+    torch.cuda.empty_cache()
+    
+    model = accelerator.unwrap_model(model).eval()
+    logger.info("Running sampling ... ")
+    if vae is None:
+        vae = AutoencoderKL.from_pretrained(config.vae_file).to(device).to(weight_dtype)
+    for idx, entry in enumerate(config.validation_prompts):
+        latent_h = int(entry["height"])//8
+        latent_w = int(entry["width"])//8
+        z = torch.randn(1, 4, latent_w, latent_h, device=device)
+        
+        prompt_tokens = tokenizer(
+            entry["prompt"], 
+            max_length=max_length, 
+            padding="max_length", 
+            truncation=True, 
+            return_tensors="pt"
+        ).to(device)
+        caption_embs = text_encoder(
+            prompt_tokens.input_ids, 
+            attention_mask=prompt_tokens.attention_mask
+            )[0].to(device)
+        emb_masks = prompt_tokens.attention_mask.to(device)
+        
+        neg_tokens = tokenizer(
+            "" if entry["negative"] is None else entry["negative"], 
+            max_length=max_length, 
+            padding="max_length", 
+            truncation=True, 
+            return_tensors="pt"
+        ).to(device)
+        neg_caption_embs = text_encoder(
+            neg_tokens.input_ids, 
+            attention_mask=neg_tokens.attention_mask
+            )[0].to(device)
+        # neg_embs_mask = neg_tokens.attention_mask
+        
+        hw = torch.tensor([[entry["height"], entry["width"]]], device=device).repeat(1, 1)
+        ar = torch.tensor([[entry["height"] / entry["width"]]], device=device).repeat(1, 1)
+        model_kwargs = dict(data_info={"img_hw": hw, "aspect_ratio": ar}, mask=emb_masks)
+        
+        dpm_solver = DPMS(
+            model.forward_with_dpmsolver,
+            condition=caption_embs,
+            uncondition=neg_caption_embs,
+            cfg_scale=float(entry["cfg"]),
+            model_kwargs=model_kwargs
+        )
+        denoised = dpm_solver.sample(
+            z,
+            steps=int(entry["steps"]),
+            order=2,
+            skip_type="time_uniform",
+            method="multistep",
+        ).to(weight_dtype)
+        
+        samples = vae.decode((1/vae.config.scaling_factor) * denoised).sample
+        ct = datetime.datetime.now()
+        fdt = ct.strftime('%Y%m%d-%H%M%S')
+        os.umask(0o000)
+        tutils.save_image(samples, f"{config.validation_samples_dir}/{config.output_model_name}_{fdt}_{idx}_{step}.png", nrow=1, normalize=True, value_range=(-1,1))
+        
+        # latents.append(denoised)
+    torch.cuda.empty_cache()
+    del vae
+    flush()    
+
 def pyramid_noise_like(noise, device, iterations=6, discount=0.4):
     b,c,w,h = noise.shape
     u = torch.nn.Upsample(size=(w,h), mode="bicubic").to(device)
@@ -369,9 +438,7 @@ def train():
             # global_step += 1
             # data_time_start = time.time()
             # =====================================
-            if config.optimizer["type"].lower().endswith("schedulefree"):
-                optimizer.optimizer.eval()
-                model.eval()
+
             if global_step % config.save_model_steps == 0:
                 # model.to(torch.float32)
                 accelerator.wait_for_everyone()
@@ -382,11 +449,13 @@ def train():
                                     epoch=epoch,
                                     name=config.output_model_name
                                     )
-            # if config.visualize and (global_step % config.eval_sampling_steps == 0 or (step + 1) == 1):
-            #     accelerator.wait_for_everyone()
-                # if accelerator.is_main_process:
-                #     log_validation(model, global_step, device=accelerator.device, vae=vae)
-
+            if config.optimizer["type"].lower().endswith("schedulefree"):
+                optimizer.optimizer.eval()
+                model.eval()
+            if config.visualize and (global_step % config.eval_sampling_steps == 0 or (step + 1) == 1):
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    log_sampling(model, global_step, device=accelerator.device, vae=vae)
         if epoch % config.save_model_epochs == 0 or epoch == config.num_epochs:
             # model.to(torch.float32)
             accelerator.wait_for_everyone()

@@ -97,7 +97,6 @@ kv_compress_config = {
     'scale_factor': 2,
     'kv_compress_layer': [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27],
 }
-visualize = False
 skip_step = 0  # skip steps during training for checkpoint resumed training, should be 0 for new finetune
 qk_norm = False
 micro_condition = False
@@ -107,12 +106,33 @@ report_to = "tensorboard"
 eval_sampling_steps = 250
 visualize = True
 log_interval = 10
+validation_samples_dir="training/samples"
 validation_prompts = [
-    "dog",
-    "portrait photo of a girl, photograph, highly detailed face, depth of field",
-    "Self-portrait oil painting, a beautiful cyborg with golden hair, 8k",
-    "Astronaut in a jungle, cold color palette, muted colors, detailed, 8k",
-    "A photo of beautiful mountain with realistic sunset and blue lake, highly detailed, masterpiece",
+    dict(
+        prompt="dog", 
+        negative=None, 
+        height=512, width=512, steps=14, cfg=4.5
+    ),
+    dict(
+        prompt="portrait photo of a girl, photograph, highly detailed face, depth of field", 
+        negative="ugly, blurry, low quality", 
+        height=1024, width=1024, steps=10, cfg=4.5
+    ),
+    dict(
+        prompt="Self-portrait oil painting, a beautiful cyborg with golden hair, 8k", 
+        negative=None, 
+        height=1024, width=1024, steps=15, cfg=4.5
+    ),
+    dict(
+        prompt="Astronaut in a jungle, cold color palette, muted colors, detailed, 8k", 
+        negative=None, 
+        height=1024, width=1024, steps=20, cfg=4.5
+    ),
+    dict(
+        prompt="A photo of beautiful mountain with realistic sunset and blue lake, highly detailed, masterpiece", 
+        negative=None, 
+        height=1024, width=1024, steps=20, cfg=4.5
+    ),
 ]
 
 # LCM
